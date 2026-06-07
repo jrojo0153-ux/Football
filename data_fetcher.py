@@ -1,9 +1,18 @@
 import os
 import sys
 from datetime import datetime
+import logging
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
+
+# Configurar el sistema de logging estructurado formal
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("data_fetcher")
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import API_FOOTBALL_KEY, API_FOOTBALL_BASE, LEAGUES
@@ -27,12 +36,16 @@ session.mount("http://", HTTPAdapter(max_retries=retries))
 def _make_request(endpoint: str, params: dict) -> dict:
     """Método auxiliar seguro para realizar peticiones HTTP."""
     url = f"{API_FOOTBALL_BASE.rstrip('/')}/{endpoint.lstrip('/')}"
+    logger.info(f"Iniciando petición GET a: {url} con parámetros: {params}")
     try:
         response = session.get(url, params=params, timeout=12)
         if response.status_code == 200:
+            logger.info(f"Petición exitosa a {url}")
             return response.json()
-    except requests.RequestException:
-        pass
+        else:
+            logger.warning(f"Error de API al solicitar {url}. Código de estado: {response.status_code}")
+    except requests.RequestException as e:
+        logger.error(f"Error de red/petición en {url}: {str(e)}", exc_info=True)
     return {}
 
 
@@ -108,6 +121,7 @@ def extract_team_features(team_id: int, league_id: int, is_home: bool) -> dict:
     last_matches = get_last_matches(team_id, last=10)
 
     if not stats:
+        logger.warning(f"No se pudieron obtener estadísticas para el equipo {team_id} en la liga {league_id}")
         return {}
 
     # Goles promedio
@@ -159,7 +173,8 @@ def extract_team_features(team_id: int, league_id: int, is_home: bool) -> dict:
             val = source
         try:
             return float(val or 0)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Error al transformar a float la clave '{key}' del equipo {team_id}: {str(e)}")
             return 0.0
 
     def safe_int(source, key):
@@ -169,7 +184,8 @@ def extract_team_features(team_id: int, league_id: int, is_home: bool) -> dict:
             val = source
         try:
             return int(val or 0)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Error al transformar a entero la clave '{key}' del equipo {team_id}: {str(e)}")
             return 0
 
     return {
@@ -190,24 +206,28 @@ def extract_team_features(team_id: int, league_id: int, is_home: bool) -> dict:
 def get_all_today_fixtures() -> list:
     """Obtiene TODOS los partidos de hoy de todas las ligas monitoreadas de forma segura."""
     all_fixtures = []
+    logger.info("Iniciando recopilación de partidos para el día de hoy.")
     for league_name, league_info in LEAGUES.items():
         league_id = league_info.get("id")
         if not league_id:
+            logger.warning(f"No se encontró un ID de liga configurado para {league_name}")
             continue
+        logger.info(f"Obteniendo partidos de hoy para: {league_name} (ID: {league_id})")
         fixtures = get_fixtures_today(league_id)
         for f in fixtures:
             f["_league_name"] = league_name
             f["_odds_key"] = league_info.get("odds_key")
         all_fixtures.extend(fixtures)
+    logger.info(f"Búsqueda finalizada. Total de partidos encontrados hoy: {len(all_fixtures)}")
     return all_fixtures
 
 
 if __name__ == "__main__":
-    print("Obteniendo partidos de hoy...")
+    logger.info("Obteniendo partidos de hoy...")
     fixtures = get_all_today_fixtures()
-    print(f"Total partidos encontrados: {len(fixtures)}")
+    logger.info(f"Total partidos encontrados: {len(fixtures)}")
     for f in fixtures:
         teams = f.get("teams") or {}
         home = teams.get("home", {}).get("name", "Desconocido")
         away = teams.get("away", {}).get("name", "Desconocido")
-        print(f"  {home} vs {away} ({f.get('_league_name', 'Liga Desconocida')})")
+        logger.info(f"  {home} vs {away} ({f.get('_league_name', 'Liga Desconocida')})")
