@@ -1,10 +1,14 @@
 import json
 import os
 import sys
+import logging
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Dict, Any
+
+# Configuración del logger para el módulo
+logger = logging.getLogger(__name__)
 
 # Configuración de entorno de ejecución e importaciones dinámicas robustas
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -14,13 +18,15 @@ if str(PARENT_DIR) not in sys.path:
 
 try:
     from config import PICKS_DIR, MIN_EV_REEMISSION
-except ImportError:
+except ImportError as e:
+    logger.warning("No se pudo importar 'config'. Se usarán los valores por defecto. Detalle: %s", e)
     PICKS_DIR = str(CURRENT_DIR / "picks_diarios")
     MIN_EV_REEMISSION = 0.05
 
 try:
     MIN_EV_REEMISSION = float(MIN_EV_REEMISSION)
-except (ValueError, TypeError):
+except (ValueError, TypeError) as e:
+    logger.error("Error al convertir MIN_EV_REEMISSION a float: %s. Reestableciendo a 0.05.", e)
     MIN_EV_REEMISSION = 0.05
 
 
@@ -46,8 +52,10 @@ class DeduplicationManager:
         try:
             if not self.picks_dir.exists():
                 self.picks_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("Directorio de picks creado exitosamente en: %s", self.picks_dir)
                 return picks
-        except OSError:
+        except OSError as e:
+            logger.error("Error de sistema de archivos al verificar/crear el directorio %s: %s", self.picks_dir, e)
             return picks
 
         pattern = f"picks_{today_str}_*.json"
@@ -62,10 +70,11 @@ class DeduplicationManager:
                                     key = self._make_key(pick)
                                     if key:
                                         picks[key] = pick
-                except (json.JSONDecodeError, IOError, TypeError):
+                except (json.JSONDecodeError, IOError, TypeError) as e:
+                    logger.warning("Error al leer o parsear el archivo de picks '%s': %s", filepath, e)
                     continue
-        except OSError:
-            pass
+        except OSError as e:
+            logger.error("Error de E/S al buscar archivos con el patrón '%s' en '%s': %s", pattern, self.picks_dir, e)
 
         return picks
 
@@ -98,10 +107,12 @@ class DeduplicationManager:
             "improved" - Ya enviado, pero el EV actual supera al anterior significativamente.
         """
         if not isinstance(pick, dict):
+            logger.warning("Se intentó evaluar un pick con un tipo de dato inválido: %s", type(pick))
             return "duplicate"
 
         key = self._make_key(pick)
         if not key:
+            logger.warning("No se pudo generar una clave para el pick evaluado: %s", pick)
             return "duplicate"
 
         with self._lock:
@@ -112,16 +123,19 @@ class DeduplicationManager:
 
             try:
                 existing_ev = float(existing.get("ev", 0.0) or 0.0)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.error("Error al convertir el EV existente a float para la clave '%s': %s", key, e)
                 existing_ev = 0.0
 
             try:
                 new_ev = float(pick.get("ev", 0.0) or 0.0)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.error("Error al convertir el nuevo EV a float para la clave '%s': %s", key, e)
                 new_ev = 0.0
 
             ev_improvement = new_ev - existing_ev
             if ev_improvement >= MIN_EV_REEMISSION:
+                logger.info("Pick mejorado detectado para clave '%s'. Incremento de EV: %.4f", key, ev_improvement)
                 return "improved"
 
             return "duplicate"
@@ -129,33 +143,40 @@ class DeduplicationManager:
     def register_pick(self, pick: dict) -> None:
         """Registra un nuevo pick de forma segura en memoria."""
         if not isinstance(pick, dict):
+            logger.warning("Se intentó registrar un pick inválido: %s", type(pick))
             return
         key = self._make_key(pick)
         if not key:
+            logger.warning("No se pudo generar clave para el registro del pick: %s", pick)
             return
 
         with self._lock:
             self.today_picks[key] = pick
+            logger.info("Pick registrado exitosamente en memoria para la clave '%s'", key)
 
     def update_pick(self, pick: dict) -> None:
         """Actualiza la información de un pick previamente registrado guardando auditoría de EV."""
         if not isinstance(pick, dict):
+            logger.warning("Se intentó actualizar un pick inválido: %s", type(pick))
             return
         key = self._make_key(pick)
         if not key:
+            logger.warning("No se pudo generar clave para la actualización del pick: %s", pick)
             return
 
         with self._lock:
             try:
                 prev_ev_raw = self.today_picks.get(key, {}).get("ev", 0.0)
                 prev_ev = float(prev_ev_raw or 0.0)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.error("Error al parsear el EV previo durante la actualización para la clave '%s': %s", key, e)
                 prev_ev = 0.0
 
             pick_copy = pick.copy()
             pick_copy["_updated_at"] = datetime.now().isoformat()
             pick_copy["_previous_ev"] = prev_ev
             self.today_picks[key] = pick_copy
+            logger.info("Pick actualizado exitosamente con auditoría para la clave '%s'", key)
 
     def get_today_count(self) -> int:
         """Obtiene la cantidad total de picks procesados en el día actual."""
@@ -185,7 +206,8 @@ class DeduplicationManager:
                 
                 try:
                     ev_sum += float(p.get("ev", 0.0) or 0.0)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    logger.warning("Error al convertir EV en el resumen de picks diarios para el elemento %s: %s", p, e)
                     pass
                 
                 picks_list.append(p)
@@ -204,14 +226,22 @@ class DeduplicationManager:
                 for f in self.picks_dir.glob("*.json"):
                     try:
                         f.unlink(missing_ok=True)
-                    except OSError:
+                    except OSError as e:
+                        logger.error("No se pudo eliminar el archivo '%s' durante la purga diaria: %s", f, e)
                         pass
             self.today_picks.clear()
+            logger.info("Purga diaria completada con éxito. Datos en memoria limpiados.")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
     dedup = DeduplicationManager()
-    print(f"Picks de hoy: {dedup.get_today_count()}")
+    logger.info("Picks de hoy: %d", dedup.get_today_count())
     summary = dedup.get_today_summary()
-    print(f"Partidos cubiertos: {summary['matches_covered']}")
-    print(f"EV promedio: {summary['avg_ev']:.4f}")
+    logger.info("Partidos cubiertos: %d", summary['matches_covered'])
+    logger.info("EV promedio: %.4f", summary['avg_ev'])
