@@ -1,6 +1,15 @@
 import os
+import logging
 from types import MappingProxyType
 from typing import Dict, Any, Final
+
+# Configuración del sistema de logging estructurado
+logger = logging.getLogger("config")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
 
 def _get_required_env(key: str, default: str = "") -> str:
     """
@@ -9,8 +18,7 @@ def _get_required_env(key: str, default: str = "") -> str:
     """
     value = os.environ.get(key, default).strip()
     if not value:
-        import warnings
-        warnings.warn(f"La variable de entorno '{key}' no está configurada o está vacía.", RuntimeWarning)
+        logger.warning("La variable de entorno '%s' no está configurada o está vacía.", key)
     return value
 
 # === API KEYS (Validación robusta desde el entorno) ===
@@ -51,9 +59,14 @@ ARCHIVE_DIR: Final[str] = os.path.join(_BASE_DIR, "archivo_historico")
 HISTORY_FILE: Final[str] = os.path.join(_BASE_DIR, "history_master.csv")
 MODEL_DIR: Final[str] = os.path.join(_BASE_DIR, "models")
 
-# Asegurar la existencia física de los directorios de trabajo
+# Asegurar la existencia física de los directorios de trabajo con logging robusto
 for _dir in (PICKS_DIR, ARCHIVE_DIR, MODEL_DIR):
-    os.makedirs(_dir, exist_ok=True)
+    try:
+        os.makedirs(_dir, exist_ok=True)
+        logger.info("Directorio verificado/creado con éxito: %s", _dir)
+    except Exception as e:
+        logger.error("Error crítico al crear el directorio '%s': %s", _dir, str(e), exc_info=True)
+        raise
 
 # === FACTORES DE DISTRIBUCIÓN POISSON ===
 POISSON_WEIGHT_HOME: Final[float] = 1.15  # Ajuste por ventaja de localía
