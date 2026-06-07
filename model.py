@@ -3,12 +3,17 @@ import pandas as pd
 import pickle
 import os
 import sys
+import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     KELLY_FRACTION, MIN_EV_THRESHOLD, CONFIDENCE_THRESHOLD,
     POISSON_WEIGHT_HOME, POISSON_WEIGHT_AWAY, MODEL_DIR, HISTORY_FILE
 )
+
+# Configuración de registro estructurado para Confiabilidad (SRE)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 class PoissonGoalModel:
@@ -34,8 +39,8 @@ class PoissonGoalModel:
                                 "avg_away_goals": avg_away,
                                 "avg_total_goals": avg_home + avg_away
                             }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Error al cargar promedios de liga desde %s: %s", HISTORY_FILE, e, exc_info=True)
 
     def predict_goals(self, home_attack: float, home_defense: float,
                       away_attack: float, away_defense: float,
@@ -141,7 +146,8 @@ class FormAdjuster:
             try:
                 with open(weights_file, "rb") as f:
                     self.historical_weights = pickle.load(f)
-            except Exception:
+            except Exception as e:
+                logger.error("Error al cargar pesos históricos desde %s: %s", weights_file, e, exc_info=True)
                 self.historical_weights = {}
 
     def save_weights(self):
@@ -150,8 +156,8 @@ class FormAdjuster:
             weights_file = os.path.join(MODEL_DIR, "learned_weights.pkl")
             with open(weights_file, "wb") as f:
                 pickle.dump(self.historical_weights, f)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Error al guardar pesos históricos en %s: %s", MODEL_DIR, e, exc_info=True)
 
     def adjust_probability(self, base_prob: float, team_features: dict,
                            h2h_data: list = None) -> float:
@@ -173,7 +179,8 @@ class FormAdjuster:
                             h2h_wins += 1
                         elif away_team.get("id") == team_id and away_team.get("winner"):
                             h2h_wins += 1
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("Error procesando registro individual de H2H: %s", e, exc_info=True)
                         continue
                 h2h_rate = h2h_wins / len(h2h_data)
                 h2h_factor = (h2h_rate - 0.33) * 0.06
@@ -216,11 +223,11 @@ if __name__ == "__main__":
     )
     
     probs = poisson_model.get_match_probabilities(result["prob_matrix"])
-    print(f"Lambda Local: {result['lambda_home']:.2f}")
-    print(f"Lambda Visitante: {result['lambda_away']:.2f}")
-    print(f"Probabilidades: Home {probs['home_win']:.2%} | Draw {probs['draw']:.2%} | Away {probs['away_win']:.2%}")
-    print(f"Over 2.5: {probs['over_2.5']:.2%} | Under 2.5: {probs['under_2.5']:.2%}")
+    logger.info(f"Lambda Local: {result['lambda_home']:.2f}")
+    logger.info(f"Lambda Visitante: {result['lambda_away']:.2f}")
+    logger.info(f"Probabilidades: Home {probs['home_win']:.2%} | Draw {probs['draw']:.2%} | Away {probs['away_win']:.2%}")
+    logger.info(f"Over 2.5: {probs['over_2.5']:.2%} | Under 2.5: {probs['under_2.5']:.2%}")
     
     pick = evaluate_pick(probs["home_win"], 1.85)
-    print(f"\nPick: Local gana @ 1.85")
-    print(f"  EV: {pick['ev_pct']} | Kelly: {pick['kelly_pct']} | Valor: {pick['is_value_bet']}")
+    logger.info(f"\nPick: Local gana @ 1.85")
+    logger.info(f"  EV: {pick['ev_pct']} | Kelly: {pick['kelly_pct']} | Valor: {pick['is_value_bet']}")
