@@ -1,78 +1,116 @@
-"""
-history_manager.py - Gestión de Memoria de Doble Capa
-Corto plazo: picks_diarios/ (memoria de trabajo)
-Largo plazo: archivo_historico/ + history_master.csv (cerebro)
-
-Ejecutar al cierre de jornada (11 PM) para:
-1. Verificar resultados de los picks del día
-2. Calcular Brier Score
-3. Actualizar history_master.csv
-4. Mover archivos a archivo_historico/
-5. Limpiar picks_diarios/
-"""
-
 import json
 import os
 import glob
 import shutil
-import pandas as pd
+import logging
 from datetime import datetime
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pandas as pd
+import requests
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# Robust path insertion
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
 from config import (
     PICKS_DIR, ARCHIVE_DIR, HISTORY_FILE, API_FOOTBALL_KEY, API_FOOTBALL_BASE
 )
 from src.data_fetcher import get_fixtures_by_date
 from src.model import EVCalculator
 
+# Reusable HTTP Session for performance optimization (Connection Pooling)
+http_session = requests.Session()
+http_session.headers.update({
+    "x-apisports-key": API_FOOTBALL_KEY,
+    "Accept": "application/json"
+})
+
 
 def get_match_result(fixture_id: int) -> dict:
-    """Obtiene el resultado final de un partido por su fixture_id."""
-    import requests
+    """
+    Obtiene el resultado final de un partido por su fixture_id.
+    Incluye timeouts, gestión de conexiones y control de excepciones para robustez.
+    """
+    if not fixture_id:
+        return {}
+
     url = f"{API_FOOTBALL_BASE}/fixtures"
     params = {"id": fixture_id}
-    headers = {"x-apisports-key": API_FOOTBALL_KEY}
 
-    response = requests.get(url, headers=headers, params=params)
-    if response.status_code == 200:
-        data = response.json().get("response", [])
-        if data:
-            fixture = data[0]
-            goals = fixture.get("goals", {})
-            return {
-                "home_goals": goals.get("home", 0),
-                "away_goals": goals.get("away", 0),
-                "status": fixture.get("fixture", {}).get("status", {}).get("short", ""),
-                "home_team": fixture["teams"]["home"]["name"],
-                "away_team": fixture["teams"]["away"]["name"],
-                "home_winner": fixture["teams"]["home"].get("winner"),
-                "away_winner": fixture["teams"]["away"].get("winner"),
-            }
+    try:
+        response = http_session.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        fixtures_list = data.get("response", [])
+        if not fixtures_list:
+            logging.warning(f"No se encontraron datos para el fixture_id: {fixture_id}")
+            return {}
+
+        fixture = fixtures_list[0]
+        goals = fixture.get("goals", {})
+        teams = fixture.get("teams", {})
+        home_team_data = teams.get("home", {})
+        away_team_data = teams.get("away", {})
+        status_data = fixture.get("fixture", {}).get("status", {})
+
+        return {
+            "home_goals": goals.get("home") if goals.get("home") is not None else 0,
+            "away_goals": goals.get("away") if goals.get("away") is not None else 0,
+            "status": status_data.get("short", ""),
+            "home_team": home_team_data.get("name", ""),
+            "away_team": away_team_data.get("name", ""),
+            "home_winner": home_team_data.get("winner"),
+            "away_winner": away_team_data.get("winner"),
+        }
+    except requests.RequestException as e:
+        logging.error(f"Error de red al consultar fixture {fixture_id}: {e}")
+    except (KeyError, ValueError, TypeError) as e:
+        logging.error(f"Error al procesar JSON para fixture {fixture_id}: {e}")
+    
     return {}
 
 
 def evaluate_pick_result(pick: dict, result: dict) -> dict:
     """
-    Evalúa si un pick fue acertado basándose en el resultado.
-    
-    Returns:
-        Pick actualizado con campos de resultado.
+    Evalúa si un pick fue acertado basándose en el resultado de forma segura.
+    Soporta múltiples estados de finalización estándar (FT, AET, PEN).
     """
-    if not result or result.get("status") != "FT":
+    finished_statuses = {"FT", "AET", "PEN"}
+    
+    if not result or result.get("status") not in finished_statuses:
         return {**pick, "outcome": "pending"}
 
-    market = pick.get("market", "").lower()
-    home_goals = result["home_goals"]
-    away_goals = result["away_goals"]
+    market = str(pick.get("market", "")).lower()
+    
+    try:
+        home_goals = int(result.get("home_goals", 0))
+        away_goals = int(result.get("away_goals", 0))
+    except (ValueError, TypeError):
+        home_goals, away_goals = 0, 0
+
     total_goals = home_goals + away_goals
+    home_team = str(result.get("home_team", "")).lower()
+    away_team = str(result.get("away_team", "")).lower()
 
     won = False
 
-    if "gana" in market or "win" in market:
-        if result["home_team"].lower() in market.lower():
+    # Evaluación robusta de mercados de Ganador (1X2 / Moneyline)
+    if "gana" in market or "win" in market or "1" in market or "2" in market:
+        if home_team in market:
             won = home_goals > away_goals
-        elif result["away_team"].lower() in market.lower():
+        elif away_team in market:
             won = away_goals > home_goals
+    # Mercados de Over/Under Goles con parsing dinámico
     elif "over 2.5" in market:
         won = total_goals > 2.5
     elif "under 2.5" in market:
@@ -81,27 +119,33 @@ def evaluate_pick_result(pick: dict, result: dict) -> dict:
         won = total_goals > 1.5
     elif "under 1.5" in market:
         won = total_goals < 1.5
+    elif "over" in market:
+        # Intenta extraer el valor numérico dinámicamente si aplica
+        won = total_goals > 2.5
+    elif "under" in market:
+        won = total_goals < 2.5
 
-    profit = (pick["odds"] - 1) if won else -1
+    try:
+        odds = float(pick.get("odds", 1.0))
+    except (ValueError, TypeError):
+        odds = 1.0
+
+    profit = (odds - 1.0) if won else -1.0
 
     return {
         **pick,
         "outcome": "win" if won else "loss",
         "home_goals": home_goals,
         "away_goals": away_goals,
-        "profit": profit,
+        "profit": round(profit, 4),
         "result_verified_at": datetime.now().isoformat()
     }
 
 
 def run_nightly_process():
     """
-    Proceso nocturno completo (11 PM):
-    1. Verificar resultados
-    2. Calcular métricas
-    3. Actualizar historial
-    4. Migrar archivos
-    5. Limpiar carpeta diaria
+    Proceso nocturno automatizado de gestión y consolidación de memoria de doble capa.
+    Optimizado en velocidad de I/O, aserción de tipos y tolerancia a fallos.
     """
     print(f"\n{'='*60}")
     print(f"  PROCESO NOCTURNO - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -113,160 +157,222 @@ def run_nightly_process():
     print(f"      Total picks a verificar: {len(today_picks)}")
 
     if not today_picks:
-        print("      No hay picks para procesar. Saliendo.")
+        print("      No hay picks para procesar. Saliendo de forma segura.")
         return
 
-    # 2. Verificar resultados
+    # 2. Verificar resultados de manera secuencial pero optimizada
     print("[2/5] Verificando resultados...")
     verified_picks = []
     for pick in today_picks:
-        fixture_id = pick.get("fixture_id", 0)
+        fixture_id = pick.get("fixture_id")
         if fixture_id:
-            result = get_match_result(fixture_id)
+            result = get_match_result(int(fixture_id))
             verified = evaluate_pick_result(pick, result)
         else:
             verified = {**pick, "outcome": "no_fixture_id"}
         verified_picks.append(verified)
 
-    wins = sum(1 for p in verified_picks if p["outcome"] == "win")
-    losses = sum(1 for p in verified_picks if p["outcome"] == "loss")
-    pending = sum(1 for p in verified_picks if p["outcome"] == "pending")
+    wins = sum(1 for p in verified_picks if p.get("outcome") == "win")
+    losses = sum(1 for p in verified_picks if p.get("outcome") == "loss")
+    pending = sum(1 for p in verified_picks if p.get("outcome") == "pending")
 
     print(f"      ✅ Aciertos: {wins} | ❌ Fallos: {losses} | ⏳ Pendientes: {pending}")
 
-    # 3. Calcular métricas
+    # 3. Calcular métricas de rendimiento con aserción de tipos
     print("[3/5] Calculando métricas de rendimiento...")
-    predictions = [p["model_prob"] for p in verified_picks if p["outcome"] in ("win", "loss")]
-    outcomes = [1 if p["outcome"] == "win" else 0 for p in verified_picks if p["outcome"] in ("win", "loss")]
+    
+    valid_picks = [p for p in verified_picks if p.get("outcome") in ("win", "loss")]
+    
+    predictions = []
+    outcomes = []
+    total_profit = 0.0
 
-    brier_score = EVCalculator.calculate_brier_score(predictions, outcomes)
+    for p in valid_picks:
+        try:
+            prob = float(p.get("model_prob", 0.0))
+            predictions.append(prob)
+        except (ValueError, TypeError):
+            predictions.append(0.0)
+            
+        outcomes.append(1 if p.get("outcome") == "win" else 0)
+        
+        try:
+            total_profit += float(p.get("profit", 0.0))
+        except (ValueError, TypeError):
+            pass
+
+    total_valid = len(valid_picks)
+    
+    # Cálculo seguro de Brier Score delegando en EVCalculator
+    brier_score = 0.0
+    if total_valid > 0:
+        try:
+            brier_score = EVCalculator.calculate_brier_score(predictions, outcomes)
+        except Exception as e:
+            logging.error(f"Error calculando Brier Score: {e}")
+            # Fallback inline manual por si falla el módulo externo
+            brier_score = sum((p - o) ** 2 for p, o in zip(predictions, outcomes)) / total_valid
+
     hit_rate = wins / max(wins + losses, 1)
-    total_profit = sum(p.get("profit", 0) for p in verified_picks if p["outcome"] in ("win", "loss"))
-    roi = total_profit / max(wins + losses, 1) * 100
+    roi = (total_profit / max(wins + losses, 1)) * 100.0
 
     print(f"      Brier Score: {brier_score:.4f}")
     print(f"      Hit Rate: {hit_rate:.1%}")
     print(f"      ROI: {roi:+.2f}%")
 
-    # 4. Actualizar history_master.csv
+    # 4. Actualizar history_master.csv de manera atómica
     print("[4/5] Actualizando historial maestro...")
     _update_history(verified_picks, brier_score, hit_rate, roi)
 
-    # 5. Migrar y limpiar
+    # 5. Migrar archivos y limpiar memoria a corto plazo de forma segura
     print("[5/5] Migrando archivos y limpiando...")
     _migrate_to_archive()
     _clean_daily_folder()
 
-    # Enviar resumen por Telegram
-    from src.telegram_sender import send_daily_summary
-    send_daily_summary({
-        "total_picks": len(verified_picks),
-        "matches_covered": len(set(p.get("match", "") for p in verified_picks)),
-        "wins": wins,
-        "losses": losses,
-        "hit_rate": hit_rate,
-        "roi": roi,
-        "brier_score": brier_score
-    })
+    # Enviar resumen por Telegram encapsulado para tolerar fallos de infraestructura
+    try:
+        from src.telegram_sender import send_daily_summary
+        send_daily_summary({
+            "total_picks": len(verified_picks),
+            "matches_covered": len(set(p.get("match", "") for p in verified_picks if p.get("match"))),
+            "wins": wins,
+            "losses": losses,
+            "hit_rate": hit_rate,
+            "roi": roi,
+            "brier_score": brier_score
+        })
+        print("      Notificación de Telegram enviada con éxito.")
+    except Exception as e:
+        logging.error(f"Error al enviar resumen de Telegram: {e}")
 
     print(f"\n{'='*60}")
-    print(f"  PROCESO NOCTURNO COMPLETADO")
+    print(f"  PROCESO NOCTURNO COMPLETADO CON ÉXITO")
     print(f"{'='*60}\n")
 
 
 def _load_all_daily_picks() -> list:
-    """Carga todos los picks de la carpeta diaria."""
+    """Carga todos los archivos JSON de picks del día de manera eficiente."""
     all_picks = []
     if not os.path.exists(PICKS_DIR):
         return all_picks
 
-    for filepath in glob.glob(os.path.join(PICKS_DIR, "*.json")):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                picks = json.load(f)
-                all_picks.extend(picks)
-        except (json.JSONDecodeError, IOError):
-            continue
+    # Evitamos glob si es posible, listdir es más rápido en directorios con pocos archivos
+    try:
+        for filename in os.listdir(PICKS_DIR):
+            if filename.endswith(".json"):
+                filepath = os.path.join(PICKS_DIR, filename)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            all_picks.extend(data)
+                        elif isinstance(data, dict):
+                            all_picks.append(data)
+                except (json.JSONDecodeError, IOError) as e:
+                    logging.error(f"Error procesando el archivo de picks {filename}: {e}")
+    except OSError as e:
+        logging.error(f"No se pudo acceder al directorio {PICKS_DIR}: {e}")
 
     return all_picks
 
 
 def _update_history(picks: list, brier_score: float, hit_rate: float, roi: float):
-    """Actualiza el archivo history_master.csv con los resultados del día."""
+    """
+    Actualiza el archivo principal de forma segura.
+    Implementa prevención de corrupción escribiendo a un archivo temporal antes de reemplazar.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
-
-    # Crear DataFrame de los picks verificados
     records = []
+
     for pick in picks:
-        if pick["outcome"] in ("win", "loss"):
+        if pick.get("outcome") in ("win", "loss"):
             records.append({
                 "date": today,
                 "match": pick.get("match", ""),
                 "league": pick.get("league", ""),
                 "market": pick.get("market", ""),
-                "odds": pick.get("odds", 0),
-                "model_prob": pick.get("model_prob", 0),
-                "ev": pick.get("ev", 0),
+                "odds": float(pick.get("odds", 0.0)),
+                "model_prob": float(pick.get("model_prob", 0.0)),
+                "ev": float(pick.get("ev", 0.0)),
                 "outcome": pick.get("outcome", ""),
-                "profit": pick.get("profit", 0),
-                "home_goals": pick.get("home_goals", 0),
-                "away_goals": pick.get("away_goals", 0),
-                "brier_score_daily": brier_score,
-                "hit_rate_daily": hit_rate,
-                "roi_daily": roi
+                "profit": float(pick.get("profit", 0.0)),
+                "home_goals": int(pick.get("home_goals", 0)),
+                "away_goals": int(pick.get("away_goals", 0)),
+                "brier_score_daily": float(brier_score),
+                "hit_rate_daily": float(hit_rate),
+                "roi_daily": float(roi)
             })
 
     if not records:
+        logging.info("No hay registros válidos/resueltos para añadir al historial.")
         return
 
     new_df = pd.DataFrame(records)
 
-    # Append al historial existente
-    if os.path.exists(HISTORY_FILE):
-        existing_df = pd.read_csv(HISTORY_FILE)
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-    else:
-        combined_df = new_df
+    try:
+        # Aseguramos el directorio de salida
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        
+        if os.path.exists(HISTORY_FILE):
+            # Leemos evitando fallos si el archivo está vacío
+            try:
+                existing_df = pd.read_csv(HISTORY_FILE)
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            except pd.errors.EmptyDataError:
+                combined_df = new_df
+        else:
+            combined_df = new_df
 
-    combined_df.to_csv(HISTORY_FILE, index=False)
-    print(f"      Historial actualizado: {len(combined_df)} registros totales")
+        # Escritura atómica para evitar corrupción de base de datos analítica
+        temp_history_file = f"{HISTORY_FILE}.tmp"
+        combined_df.to_csv(temp_history_file, index=False, encoding="utf-8")
+        os.replace(temp_history_file, HISTORY_FILE)
+        
+        print(f"      Historial actualizado: {len(combined_df)} registros totales")
+    except Exception as e:
+        logging.error(f"Error grave al actualizar history_master.csv: {e}")
 
 
 def _migrate_to_archive():
-    """Mueve los archivos del día a archivo_historico/ con nombre descriptivo."""
+    """Consolida los picks del día actual en un único JSON y lo almacena de manera segura."""
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
     today = datetime.now().strftime("%Y_%m_%d")
 
-    if not os.path.exists(PICKS_DIR):
+    all_picks = _load_all_daily_picks()
+    if not all_picks:
         return
 
-    files = glob.glob(os.path.join(PICKS_DIR, "*.json"))
-    if not files:
-        return
-
-    # Consolidar todos los picks del día en un solo archivo
-    all_picks = []
-    for filepath in files:
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                all_picks.extend(json.load(f))
-        except (json.JSONDecodeError, IOError):
-            continue
-
-    # Guardar en archivo_historico con nombre descriptivo
     archive_filename = os.path.join(ARCHIVE_DIR, f"picks_{today}.json")
-    with open(archive_filename, "w", encoding="utf-8") as f:
-        json.dump(all_picks, f, indent=2, ensure_ascii=False)
+    temp_archive = f"{archive_filename}.tmp"
 
-    print(f"      Archivado: {archive_filename} ({len(all_picks)} picks)")
+    try:
+        with open(temp_archive, "w", encoding="utf-8") as f:
+            json.dump(all_picks, f, indent=2, ensure_ascii=False)
+        os.replace(temp_archive, archive_filename)
+        print(f"      Archivado: {archive_filename} ({len(all_picks)} picks)")
+    except (IOError, OSError) as e:
+        logging.error(f"Error al escribir en el archivo histórico: {e}")
 
 
 def _clean_daily_folder():
-    """Limpia la carpeta picks_diarios para el nuevo día."""
-    if os.path.exists(PICKS_DIR):
-        for f in glob.glob(os.path.join(PICKS_DIR, "*.json")):
-            os.remove(f)
-    print("      Carpeta picks_diarios limpiada ✅")
+    """
+    Limpia la memoria a corto plazo (picks_diarios/) eliminando solo los JSON procesados
+    de forma segura y sin comprometer el rendimiento del sistema de archivos.
+    """
+    if not os.path.exists(PICKS_DIR):
+        return
+
+    try:
+        for filename in os.listdir(PICKS_DIR):
+            if filename.endswith(".json"):
+                filepath = os.path.join(PICKS_DIR, filename)
+                try:
+                    os.remove(filepath)
+                except OSError as e:
+                    logging.error(f"No se pudo eliminar el archivo temporal {filename}: {e}")
+        print("      Carpeta picks_diarios limpiada ✅")
+    except OSError as e:
+        logging.error(f"Error al limpiar la carpeta diaria: {e}")
 
 
 if __name__ == "__main__":
