@@ -73,9 +73,9 @@ def get_match_result(fixture_id: int) -> dict:
             "away_winner": away_team_data.get("winner"),
         }
     except requests.RequestException as e:
-        logging.error(f"Error de red al consultar fixture {fixture_id}: {e}")
+        logging.error(f"Error de red al consultar fixture {fixture_id}: {e}", exc_info=True)
     except (KeyError, ValueError, TypeError) as e:
-        logging.error(f"Error al procesar JSON para fixture {fixture_id}: {e}")
+        logging.error(f"Error al procesar JSON para fixture {fixture_id}: {e}", exc_info=True)
     
     return {}
 
@@ -95,7 +95,8 @@ def evaluate_pick_result(pick: dict, result: dict) -> dict:
     try:
         home_goals = int(result.get("home_goals", 0))
         away_goals = int(result.get("away_goals", 0))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logging.warning(f"Error al convertir goles a entero en evaluate_pick_result (usando 0 por defecto): {e}")
         home_goals, away_goals = 0, 0
 
     total_goals = home_goals + away_goals
@@ -127,7 +128,8 @@ def evaluate_pick_result(pick: dict, result: dict) -> dict:
 
     try:
         odds = float(pick.get("odds", 1.0))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logging.warning(f"Error al convertir cuota (odds) a float en evaluate_pick_result (usando 1.0 por defecto): {e}")
         odds = 1.0
 
     profit = (odds - 1.0) if won else -1.0
@@ -147,21 +149,19 @@ def run_nightly_process():
     Proceso nocturno automatizado de gestión y consolidación de memoria de doble capa.
     Optimizado en velocidad de I/O, aserción de tipos y tolerancia a fallos.
     """
-    print(f"\n{'='*60}")
-    print(f"  PROCESO NOCTURNO - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"{'='*60}\n")
+    logging.info(f"PROCESO NOCTURNO INICIADO - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     # 1. Cargar picks del día
-    print("[1/5] Cargando picks del día...")
+    logging.info("[1/5] Cargando picks del día...")
     today_picks = _load_all_daily_picks()
-    print(f"      Total picks a verificar: {len(today_picks)}")
+    logging.info(f"      Total picks a verificar: {len(today_picks)}")
 
     if not today_picks:
-        print("      No hay picks para procesar. Saliendo de forma segura.")
+        logging.warning("      No hay picks para procesar. Saliendo de forma segura.")
         return
 
     # 2. Verificar resultados de manera secuencial pero optimizada
-    print("[2/5] Verificando resultados...")
+    logging.info("[2/5] Verificando resultados...")
     verified_picks = []
     for pick in today_picks:
         fixture_id = pick.get("fixture_id")
@@ -176,10 +176,10 @@ def run_nightly_process():
     losses = sum(1 for p in verified_picks if p.get("outcome") == "loss")
     pending = sum(1 for p in verified_picks if p.get("outcome") == "pending")
 
-    print(f"      ✅ Aciertos: {wins} | ❌ Fallos: {losses} | ⏳ Pendientes: {pending}")
+    logging.info(f"      ✅ Aciertos: {wins} | ❌ Fallos: {losses} | ⏳ Pendientes: {pending}")
 
     # 3. Calcular métricas de rendimiento con aserción de tipos
-    print("[3/5] Calculando métricas de rendimiento...")
+    logging.info("[3/5] Calculando métricas de rendimiento...")
     
     valid_picks = [p for p in verified_picks if p.get("outcome") in ("win", "loss")]
     
@@ -191,15 +191,16 @@ def run_nightly_process():
         try:
             prob = float(p.get("model_prob", 0.0))
             predictions.append(prob)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Error parseando model_prob para pick: {p}. Usando 0.0 por defecto. Detalle: {e}")
             predictions.append(0.0)
             
         outcomes.append(1 if p.get("outcome") == "win" else 0)
         
         try:
             total_profit += float(p.get("profit", 0.0))
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Error parseando profit para pick: {p}. Ignorando en cálculo de profit. Detalle: {e}")
 
     total_valid = len(valid_picks)
     
@@ -209,23 +210,23 @@ def run_nightly_process():
         try:
             brier_score = EVCalculator.calculate_brier_score(predictions, outcomes)
         except Exception as e:
-            logging.error(f"Error calculando Brier Score: {e}")
+            logging.error(f"Error calculando Brier Score: {e}", exc_info=True)
             # Fallback inline manual por si falla el módulo externo
             brier_score = sum((p - o) ** 2 for p, o in zip(predictions, outcomes)) / total_valid
 
     hit_rate = wins / max(wins + losses, 1)
     roi = (total_profit / max(wins + losses, 1)) * 100.0
 
-    print(f"      Brier Score: {brier_score:.4f}")
-    print(f"      Hit Rate: {hit_rate:.1%}")
-    print(f"      ROI: {roi:+.2f}%")
+    logging.info(f"      Brier Score: {brier_score:.4f}")
+    logging.info(f"      Hit Rate: {hit_rate:.1%}")
+    logging.info(f"      ROI: {roi:+.2f}%")
 
     # 4. Actualizar history_master.csv de manera atómica
-    print("[4/5] Actualizando historial maestro...")
+    logging.info("[4/5] Actualizando historial maestro...")
     _update_history(verified_picks, brier_score, hit_rate, roi)
 
     # 5. Migrar archivos y limpiar memoria a corto plazo de forma segura
-    print("[5/5] Migrando archivos y limpiando...")
+    logging.info("[5/5] Migrando archivos y limpiando...")
     _migrate_to_archive()
     _clean_daily_folder()
 
@@ -241,13 +242,11 @@ def run_nightly_process():
             "roi": roi,
             "brier_score": brier_score
         })
-        print("      Notificación de Telegram enviada con éxito.")
+        logging.info("      Notificación de Telegram enviada con éxito.")
     except Exception as e:
-        logging.error(f"Error al enviar resumen de Telegram: {e}")
+        logging.error(f"Error al enviar resumen de Telegram: {e}", exc_info=True)
 
-    print(f"\n{'='*60}")
-    print(f"  PROCESO NOCTURNO COMPLETADO CON ÉXITO")
-    print(f"{'='*60}\n")
+    logging.info("PROCESO NOCTURNO COMPLETADO CON ÉXITO")
 
 
 def _load_all_daily_picks() -> list:
@@ -269,9 +268,9 @@ def _load_all_daily_picks() -> list:
                         elif isinstance(data, dict):
                             all_picks.append(data)
                 except (json.JSONDecodeError, IOError) as e:
-                    logging.error(f"Error procesando el archivo de picks {filename}: {e}")
+                    logging.error(f"Error procesando el archivo de picks {filename}: {e}", exc_info=True)
     except OSError as e:
-        logging.error(f"No se pudo acceder al directorio {PICKS_DIR}: {e}")
+        logging.error(f"No se pudo acceder al directorio {PICKS_DIR}: {e}", exc_info=True)
 
     return all_picks
 
@@ -318,7 +317,8 @@ def _update_history(picks: list, brier_score: float, hit_rate: float, roi: float
             try:
                 existing_df = pd.read_csv(HISTORY_FILE)
                 combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            except pd.errors.EmptyDataError:
+            except pd.errors.EmptyDataError as e:
+                logging.warning(f"El archivo histórico {HISTORY_FILE} estaba vacío, inicializándolo de nuevo. Detalle: {e}")
                 combined_df = new_df
         else:
             combined_df = new_df
@@ -328,9 +328,9 @@ def _update_history(picks: list, brier_score: float, hit_rate: float, roi: float
         combined_df.to_csv(temp_history_file, index=False, encoding="utf-8")
         os.replace(temp_history_file, HISTORY_FILE)
         
-        print(f"      Historial actualizado: {len(combined_df)} registros totales")
+        logging.info(f"      Historial actualizado: {len(combined_df)} registros totales")
     except Exception as e:
-        logging.error(f"Error grave al actualizar history_master.csv: {e}")
+        logging.error(f"Error grave al actualizar history_master.csv: {e}", exc_info=True)
 
 
 def _migrate_to_archive():
@@ -349,9 +349,9 @@ def _migrate_to_archive():
         with open(temp_archive, "w", encoding="utf-8") as f:
             json.dump(all_picks, f, indent=2, ensure_ascii=False)
         os.replace(temp_archive, archive_filename)
-        print(f"      Archivado: {archive_filename} ({len(all_picks)} picks)")
+        logging.info(f"      Archivado: {archive_filename} ({len(all_picks)} picks)")
     except (IOError, OSError) as e:
-        logging.error(f"Error al escribir en el archivo histórico: {e}")
+        logging.error(f"Error al escribir en el archivo histórico: {e}", exc_info=True)
 
 
 def _clean_daily_folder():
@@ -369,10 +369,10 @@ def _clean_daily_folder():
                 try:
                     os.remove(filepath)
                 except OSError as e:
-                    logging.error(f"No se pudo eliminar el archivo temporal {filename}: {e}")
-        print("      Carpeta picks_diarios limpiada ✅")
+                    logging.error(f"No se pudo eliminar el archivo temporal {filename}: {e}", exc_info=True)
+        logging.info("      Carpeta picks_diarios limpiada ✅")
     except OSError as e:
-        logging.error(f"Error al limpiar la carpeta diaria: {e}")
+        logging.error(f"Error al limpiar la carpeta diaria: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
